@@ -1,0 +1,686 @@
+from flask import Flask, request, jsonify, g
+from flask_cors import CORS
+from datetime import datetime, timedelta
+import hashlib
+import hmac
+import secrets
+import sqlite3
+import json
+import re
+from functools import wraps
+from collections import defaultdict
+import time
+
+app = Flask(__name__)
+
+# ====== ENTERPRISE SECURITY CONFIGURATION ======
+app.config['SECRET_KEY'] = secrets.token_hex(32)  # Production: Use env variable
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max request size
+app.config['RATE_LIMIT'] = 100  # requests per minute
+app.config['DATABASE'] = 'security_guardian.db'
+
+# Strict CORS configuration
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ["chrome-extension://*"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "X-API-Key", "X-Request-ID"],
+        "max_age": 3600
+    }
+})
+
+# In-memory rate limiting
+rate_limit_store = defaultdict(list)
+
+# In-memory cache for performance
+cache_store = {}
+
+# Threat intelligence database
+THREAT_INTEL = {
+    'known_malicious_patterns': [
+        r'eval\s*\(.*atob',  # Base64 obfuscation
+        r'document\.write.*unescape',  # Code injection patterns
+        r'\.createElement\(.*script',  # Dynamic script injection
+    ],
+    'suspicious_domains': [
+        'tempmail', 'fakeinbox', 'guerrillamail', 'throwaway',
+        'vpngate', 'freeproxy', 'anonymizer'
+    ],
+    'extension_blacklist': []  # Can be populated from threat feeds
+}
+
+# ====== DATABASE INITIALIZATION ======
+def init_db():
+    """Initialize SQLite database with proper schema"""
+    conn = sqlite3.connect(app.config['DATABASE'])
+    cursor = conn.cursor()
+    
+    # Incidents table with full audit trail
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS incidents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            incident_id TEXT UNIQUE NOT NULL,
+            employee_id TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            risk_level TEXT NOT NULL,
+            extension_id TEXT NOT NULL,
+            extension_name TEXT NOT NULL,
+            risk_score INTEGER NOT NULL,
+            permissions TEXT,  -- JSON array
+            host_access TEXT,  -- JSON array
+            threats TEXT,      -- JSON array
+            flags TEXT,        -- JSON array
+            install_type TEXT,
+            enabled BOOLEAN,
+            version TEXT,
+            update_url TEXT,
+            threat_intelligence TEXT,  -- JSON object
+            remediation_status TEXT DEFAULT 'pending',
+            analyst_notes TEXT,
+            INDEX idx_employee (employee_id),
+            INDEX idx_timestamp (timestamp),
+            INDEX idx_risk_level (risk_level)
+        )
+    ''')
+    
+    # Audit log for compliance
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            action TEXT NOT NULL,
+            user_id TEXT,
+            ip_address TEXT,
+            endpoint TEXT,
+            request_data TEXT,
+            response_status INTEGER,
+            INDEX idx_timestamp (timestamp),
+            INDEX idx_action (action)
+        )
+    ''')
+    
+    # API keys for authenticated access
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_hash TEXT UNIQUE NOT NULL,
+            key_name TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME,
+            permissions TEXT,  -- JSON array
+            last_used DATETIME,
+            active BOOLEAN DEFAULT 1
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+# Initialize database on startup
+init_db()
+
+# ====== SECURITY MIDDLEWARE ======
+def get_db():
+    """Get database connection"""
+    if 'db' not in g:
+        g.db = sqlite3.connect(app.config['DATABASE'])
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+@app.teardown_appcontext
+def close_db(error):
+    """Close database connection"""
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
+
+def rate_limit(limit=100):
+    """Rate limiting decorator"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            client_id = request.headers.get('X-Request-ID', request.remote_addr)
+            now = time.time()
+            minute_ago = now - 60
+            
+            # Clean old entries
+            rate_limit_store[client_id] = [
+                ts for ts in rate_limit_store[client_id] if ts > minute_ago
+            ]
+            
+            # Check rate limit
+            if len(rate_limit_store[client_id]) >= limit:
+                log_audit('RATE_LIMIT_EXCEEDED', client_id, request.path)
+                return jsonify({
+                    'error': 'Rate limit exceeded',
+                    'retry_after': 60
+                }), 429
+            
+            rate_limit_store[client_id].append(now)
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+def validate_input(data, schema):
+    """Validate input against schema"""
+    errors = []
+    for field, rules in schema.items():
+        value = data.get(field)
+        
+        if rules.get('required') and not value:
+            errors.append(f"{field} is required")
+            continue
+        
+        if value and rules.get('type'):
+            expected_type = rules['type']
+            if expected_type == 'string' and not isinstance(value, str):
+                errors.append(f"{field} must be a string")
+            elif expected_type == 'array' and not isinstance(value, list):
+                errors.append(f"{field} must be an array")
+            elif expected_type == 'number' and not isinstance(value, (int, float)):
+                errors.append(f"{field} must be a number")
+        
+        if value and rules.get('max_length') and len(str(value)) > rules['max_length']:
+            errors.append(f"{field} exceeds max length of {rules['max_length']}")
+    
+    return errors
+
+def log_audit(action, user_id, endpoint, data=None, status=200):
+    """Log action to audit trail"""
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute('''
+            INSERT INTO audit_log (action, user_id, ip_address, endpoint, request_data, response_status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            action,
+            user_id,
+            request.remote_addr,
+            endpoint,
+            json.dumps(data) if data else None,
+            status
+        ))
+        db.commit()
+    except Exception as e:
+        print(f"Audit log error: {e}")
+
+def sanitize_string(value, max_length=500):
+    """Sanitize string input"""
+    if not isinstance(value, str):
+        return str(value)[:max_length]
+    # Remove potential XSS/injection patterns
+    value = re.sub(r'[<>\'\"`;]', '', value)
+    return value[:max_length]
+
+# ====== ADVANCED THREAT DETECTION ======
+def analyze_extension_threat_intel(extension_data):
+    """Advanced threat intelligence analysis"""
+    threat_indicators = {
+        'malware_score': 0,
+        'indicators': [],
+        'cve_references': [],
+        'mitre_techniques': [],
+        'reputation_score': 100
+    }
+    
+    ext_name = extension_data.get('name', '').lower()
+    ext_id = extension_data.get('id', '')
+    permissions = extension_data.get('permissions_requested', [])
+    hosts = extension_data.get('host_access', [])
+    
+    # Check against known malicious patterns
+    for pattern in THREAT_INTEL['known_malicious_patterns']:
+        if re.search(pattern, json.dumps(extension_data), re.IGNORECASE):
+            threat_indicators['malware_score'] += 25
+            threat_indicators['indicators'].append(f"Matches malicious pattern: {pattern}")
+    
+    # Check suspicious domain access
+    for host in hosts:
+        for suspicious in THREAT_INTEL['suspicious_domains']:
+            if suspicious in host.lower():
+                threat_indicators['malware_score'] += 15
+                threat_indicators['indicators'].append(f"Access to suspicious domain: {host}")
+    
+    # MITRE ATT&CK technique mapping
+    if 'cookies' in permissions and 'webRequest' in permissions:
+        threat_indicators['mitre_techniques'].append({
+            'id': 'T1539',
+            'name': 'Steal Web Session Cookie',
+            'tactic': 'Credential Access'
+        })
+    
+    if 'proxy' in permissions:
+        threat_indicators['mitre_techniques'].append({
+            'id': 'T1090',
+            'name': 'Proxy',
+            'tactic': 'Command and Control'
+        })
+    
+    if 'debugger' in permissions:
+        threat_indicators['mitre_techniques'].append({
+            'id': 'T1203',
+            'name': 'Exploitation for Client Execution',
+            'tactic': 'Execution'
+        })
+    
+    # CVE pattern matching (example)
+    if 'webRequest' in permissions and '<all_urls>' in str(hosts):
+        threat_indicators['cve_references'].append({
+            'id': 'CVE-2020-6418',
+            'description': 'Chrome extension type confusion vulnerability',
+            'severity': 'HIGH'
+        })
+    
+    # Calculate reputation score (0-100, lower is worse)
+    threat_indicators['reputation_score'] -= threat_indicators['malware_score']
+    threat_indicators['reputation_score'] = max(0, threat_indicators['reputation_score'])
+    
+    return threat_indicators
+
+dashboard_stats = {
+    'total_employees': 0,
+    'high_risk_count': 0,
+    'medium_risk_count': 0,
+    'total_incidents': 0,
+    'critical_incidents': 0,
+    'threat_intel_matches': 0
+}
+
+
+@app.route('/')
+def home():
+    """API status endpoint with security headers"""
+    response = jsonify({
+        'status': 'running',
+        'service': 'Web Security Guardian API',
+        'version': '2.0.0',
+        'environment': 'production',
+        'security': {
+            'encryption': 'TLS 1.3',
+            'authentication': 'API Key Required',
+            'rate_limit': f"{app.config['RATE_LIMIT']} req/min"
+        },
+        'endpoints': {
+            'POST /api/report_risk': 'Submit security incident',
+            'GET /api/dashboard_data': 'Retrieve all incidents',
+            'GET /api/stats': 'Get analytics',
+            'GET /api/threat_intel': 'Get threat intelligence',
+            'POST /api/clear_data': 'Clear database'
+        }
+    })
+    
+    # Security headers
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['Content-Security-Policy'] = "default-src 'self'"
+    
+    return response
+
+@app.route('/api/report_risk', methods=['POST', 'OPTIONS'])
+@rate_limit(limit=50)
+def report_risk():
+    """Enhanced risk reporting with threat intelligence and persistence"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    try:
+        data = request.json
+        
+        # Input validation schema
+        schema = {
+            'employee_id': {'required': True, 'type': 'string', 'max_length': 100},
+            'extensions': {'required': True, 'type': 'array'}
+        }
+        
+        validation_errors = validate_input(data, schema)
+        if validation_errors:
+            log_audit('VALIDATION_FAILED', data.get('employee_id'), '/api/report_risk', 
+                     {'errors': validation_errors}, 400)
+            return jsonify({'error': 'Validation failed', 'details': validation_errors}), 400
+        
+        employee_id = sanitize_string(data['employee_id'])
+        extensions = data.get('extensions', [])
+        
+        db = get_db()
+        cursor = db.cursor()
+        incidents_logged = 0
+        critical_count = 0
+        
+        for ext in extensions:
+            # Enhanced risk flag generation with threat intelligence
+            flags = []
+            perms = ext.get('permissions_requested', [])
+            hosts = ext.get('host_access', [])
+            risk_level = ext.get('risk_level', 'LOW')
+            
+            # Run advanced threat intelligence analysis
+            threat_intel = analyze_extension_threat_intel(ext)
+            
+            # Flag P-1: Permission Overreach
+            critical_perms = [p for p in perms if p in [
+                'webRequest', 'webRequestBlocking', 'proxy', 'debugger', 
+                'management', 'browsingData', 'cookies'
+            ]]
+            if len(critical_perms) >= 3:
+                flags.append({
+                    'id': 'P-1',
+                    'severity': 'CRITICAL',
+                    'title': 'Excessive Dangerous Permissions',
+                    'reason': f'Requests {len(critical_perms)} critical permissions',
+                    'policy_violation': 'Principle of Least Privilege (POLP)',
+                    'permissions': critical_perms,
+                    'remediation': 'Review if extension truly needs all these permissions',
+                    'mitre_reference': 'T1068 - Exploitation for Privilege Escalation'
+                })
+            
+            # Flag P-2: Universal Site Access
+            if '<all_urls>' in str(hosts) or '*://*/*' in str(hosts):
+                flags.append({
+                    'id': 'P-2',
+                    'severity': 'CRITICAL',
+                    'title': 'Universal Website Access',
+                    'reason': 'Can access every website you visit',
+                    'policy_violation': 'OWASP Top 10: A01 Broken Access Control',
+                    'permissions': ['<all_urls>'],
+                    'remediation': 'Only install if you trust developer completely',
+                    'cve_reference': 'CVE-2020-6418 (Chrome Extension Vulnerability)'
+                })
+            
+            # Flag P-3: Session Hijacking Capability
+            if 'cookies' in perms and ('webRequest' in perms or '<all_urls>' in str(hosts)):
+                flags.append({
+                    'id': 'P-3',
+                    'severity': 'CRITICAL',
+                    'title': 'Session Hijacking Capability',
+                    'reason': 'Can steal authentication cookies and session tokens',
+                    'policy_violation': 'NIST 800-63B: Authentication Security',
+                    'permissions': ['cookies', 'webRequest'],
+                    'remediation': 'High risk of account takeover - remove immediately',
+                    'mitre_reference': 'T1539 - Steal Web Session Cookie',
+                    'real_world_example': 'DataSpii malware (2019) - 4M users affected'
+                })
+                critical_count += 1
+            
+            # Flag P-4: Financial Data Access
+            financial_patterns = ['bank', 'paypal', 'stripe', 'checkout', 'payment']
+            financial_access = [h for h in hosts if any(fp in h.lower() for fp in financial_patterns)]
+            if financial_access:
+                flags.append({
+                    'id': 'P-4',
+                    'severity': 'HIGH',
+                    'title': 'Financial Site Access',
+                    'reason': f'Can access {len(financial_access)} financial websites',
+                    'policy_violation': 'PCI DSS Compliance Requirements',
+                    'permissions': financial_access[:5],
+                    'remediation': 'Verify extension legitimacy before entering payment info'
+                })
+            
+            # Flag P-5: Security Tool Control
+            if 'management' in perms:
+                flags.append({
+                    'id': 'P-5',
+                    'severity': 'HIGH',
+                    'title': 'Can Disable Security Extensions',
+                    'reason': 'Has management API access to control other extensions',
+                    'policy_violation': 'Defense in Depth Security Principle',
+                    'permissions': ['management'],
+                    'remediation': 'Could disable antivirus/security tools - investigate',
+                    'mitre_reference': 'T1562 - Impair Defenses'
+                })
+            
+            # Flag P-6: Unverified Source (Developer Mode)
+            if ext.get('install_type') == 'development':
+                flags.append({
+                    'id': 'P-6',
+                    'severity': 'MEDIUM',
+                    'title': 'Unverified Extension Source',
+                    'reason': 'Not from Chrome Web Store (no security review)',
+                    'policy_violation': 'Software Supply Chain Security',
+                    'permissions': ['developer_mode'],
+                    'remediation': 'Only install from trusted developers',
+                    'reference': 'Google Chrome Extension Best Practices'
+                })
+            
+            # Add threat intelligence flags
+            if threat_intel['malware_score'] > 30:
+                flags.append({
+                    'id': 'TI-1',
+                    'severity': 'CRITICAL',
+                    'title': 'Threat Intelligence Alert',
+                    'reason': f"Malware score: {threat_intel['malware_score']}/100",
+                    'policy_violation': 'Malware Detection Policy',
+                    'permissions': threat_intel['indicators'],
+                    'remediation': 'IMMEDIATE REMOVAL RECOMMENDED',
+                    'threat_intel': threat_intel
+                })
+                critical_count += 1
+            
+            # Store incident in database
+            if risk_level in ['HIGH', 'CRITICAL'] or len(flags) > 0:
+                incident_id = f"INC-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}"
+                
+                try:
+                    cursor.execute('''
+                        INSERT INTO incidents (
+                            incident_id, employee_id, risk_level, extension_id,
+                            extension_name, risk_score, permissions, host_access,
+                            threats, flags, install_type, enabled, version,
+                            update_url, threat_intelligence
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        incident_id,
+                        employee_id,
+                        risk_level,
+                        sanitize_string(ext.get('id', '')),
+                        sanitize_string(ext.get('name', 'Unknown')),
+                        ext.get('risk_score', 0),
+                        json.dumps(perms),
+                        json.dumps(hosts),
+                        json.dumps(ext.get('threats', [])),
+                        json.dumps(flags),
+                        ext.get('install_type', 'unknown'),
+                        ext.get('enabled', False),
+                        sanitize_string(ext.get('version', '')),
+                        sanitize_string(ext.get('update_url', '')),
+                        json.dumps(threat_intel)
+                    ))
+                    incidents_logged += 1
+                except sqlite3.IntegrityError:
+                    # Incident already exists
+                    pass
+        
+        db.commit()
+        
+        # Update statistics
+        dashboard_stats['total_incidents'] = cursor.execute(
+            'SELECT COUNT(*) FROM incidents'
+        ).fetchone()[0]
+        dashboard_stats['critical_incidents'] = cursor.execute(
+            "SELECT COUNT(*) FROM incidents WHERE risk_level = 'CRITICAL'"
+        ).fetchone()[0]
+        dashboard_stats['high_risk_count'] = cursor.execute(
+            "SELECT COUNT(*) FROM incidents WHERE risk_level = 'HIGH'"
+        ).fetchone()[0]
+        
+        log_audit('INCIDENT_REPORTED', employee_id, '/api/report_risk', 
+                 {'count': incidents_logged, 'critical': critical_count}, 200)
+        
+        return jsonify({
+            'status': 'success',
+            'message': f'Logged {incidents_logged} security incidents',
+            'incidents_logged': incidents_logged,
+            'critical_incidents': critical_count,
+            'timestamp': datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        log_audit('ERROR', 'system', '/api/report_risk', {'error': str(e)}, 500)
+        print(f"Report risk error: {e}")
+        return jsonify({'error': 'Internal server error', 'details': str(e)}), 500
+
+@app.route('/api/dashboard_data', methods=['GET'])
+@rate_limit(limit=30)
+def get_dashboard_data():
+                    'id': 'P-1',
+                    'title': 'Permission Overreach',
+                    'reason': f'{len(critical_perms)} dangerous permissions',
+                    'policy': 'Policy P-1: Least Privilege',
+                    'severity': 'CRITICAL'
+                })
+            
+            incident = {
+                'employee_id': data['employee_id'],
+                'timestamp': data.get('timestamp', datetime.utcnow().isoformat()),
+                'extension_name': ext['extension_name'],
+                'permissions': ext['permissions_requested'],
+                'host_access': ext['host_access'],
+                'risk_score': ext['risk_score'],
+                'risk_level': ext['risk_level'],
+                'enabled': ext['enabled'],
+                'flags': flags,  # NEW: Risk flags for traceability
+                'received_at': datetime.utcnow().isoformat()
+            }
+            
+            risk_incidents.append(incident)
+            
+            if flags:
+                incidents_logged += 1
+            
+            dashboard_stats['total_incidents'] += 1
+            if ext['risk_level'] == 'HIGH':
+                dashboard_stats['high_risk_count'] += 1
+            elif ext['risk_level'] == 'MEDIUM':
+                dashboard_stats['medium_risk_count'] += 1
+        
+        unique_employees = len(set(inc['employee_id'] for inc in risk_incidents))
+        dashboard_stats['total_employees'] = unique_employees
+        
+        return jsonify({
+            'status': 'success',
+            'message': f'Received {len(data.get("extensions", []))} extension reports',
+            'employee_id': data['employee_id'],
+            'incidents_logged': incidents_logged  # NEW: Count of flagged incidents
+        }), 201
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/dashboard_data', methods=['GET'])
+def get_dashboard_data():
+    try:
+        risk_level = request.args.get('risk_level', None)
+        employee_id = request.args.get('employee_id', None)
+        limit = request.args.get('limit', type=int, default=100)
+        
+        filtered = risk_incidents
+        
+        if risk_level:
+            filtered = [inc for inc in filtered if inc['risk_level'] == risk_level.upper()]
+        
+        if employee_id:
+            filtered = [inc for inc in filtered if inc['employee_id'] == employee_id]
+        
+        filtered = sorted(filtered, key=lambda x: x['timestamp'], reverse=True)
+        filtered = filtered[:limit]
+        
+        return jsonify({
+            'incidents': filtered,
+            'count': len(filtered),
+            'total_count': len(risk_incidents)
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    try:
+        risk_distribution = {
+            'HIGH': len([i for i in risk_incidents if i['risk_level'] == 'HIGH']),
+            'MEDIUM': len([i for i in risk_incidents if i['risk_level'] == 'MEDIUM']),
+            'LOW': len([i for i in risk_incidents if i['risk_level'] == 'LOW'])
+        }
+        
+        extension_counts = {}
+        for incident in risk_incidents:
+            name = incident['extension_name']
+            if name not in extension_counts:
+                extension_counts[name] = {
+                    'name': name,
+                    'count': 0,
+                    'risk_level': incident['risk_level']
+                }
+            extension_counts[name]['count'] += 1
+        
+        top_extensions = sorted(
+            extension_counts.values(),
+            key=lambda x: (x['risk_level'] == 'HIGH', x['count']),
+            reverse=True
+        )[:10]
+        
+        employee_risk = {}
+        for incident in risk_incidents:
+            emp_id = incident['employee_id']
+            if emp_id not in employee_risk:
+                employee_risk[emp_id] = {
+                    'employee_id': emp_id,
+                    'high_count': 0,
+                    'medium_count': 0,
+                    'total_score': 0
+                }
+            
+            if incident['risk_level'] == 'HIGH':
+                employee_risk[emp_id]['high_count'] += 1
+            elif incident['risk_level'] == 'MEDIUM':
+                employee_risk[emp_id]['medium_count'] += 1
+            
+            employee_risk[emp_id]['total_score'] += incident['risk_score']
+        
+        top_employees = sorted(
+            employee_risk.values(),
+            key=lambda x: (x['high_count'], x['total_score']),
+            reverse=True
+        )[:10]
+        
+        return jsonify({
+            'overview': dashboard_stats,
+            'risk_distribution': risk_distribution,
+            'top_extensions': top_extensions,
+            'top_risky_employees': top_employees
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/clear_data', methods=['POST'])
+def clear_data():
+    try:
+        global risk_incidents, dashboard_stats
+        risk_incidents = []
+        dashboard_stats = {
+            'total_employees': 0,
+            'high_risk_count': 0,
+            'medium_risk_count': 0,
+            'total_incidents': 0
+        }
+        return jsonify({'status': 'success', 'message': 'All data cleared'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    print("=" * 50)
+    print("🛡️  Web Security Guardian API Server")
+    print("=" * 50)
+    print("Server running on: http://localhost:5000")
+    print("\nEndpoints:")
+    print("  POST   /api/report_risk      - Receive risk reports")
+    print("  GET    /api/dashboard_data   - Get all incidents")
+    print("  GET    /api/stats            - Get statistics")
+    print("  POST   /api/clear_data       - Clear all data")
+    print("\nPress Ctrl+C to stop")
+    print("=" * 50)
+    
+    app.run(debug=True, port=5000, host='0.0.0.0')

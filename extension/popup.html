@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Web Security Guardian</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="header">
+    <div class="header-icon">🛡️</div>
+    <div class="header-text">
+      <h1>Web Security Guardian</h1>
+      <p>Real-time browser risk scanner</p>
+    </div>
+  </header>
+
+  <div id="loading" class="loading">
+    <div class="spinner"></div>
+    <p>Scanning...</p>
+  </div>
+
+  <div id="content" class="content" style="display: none;">
+    <div class="score-card">
+      <div class="score-meter">
+        <svg width="120" height="120" class="score-circle">
+          <circle cx="60" cy="60" r="54" class="score-bg"></circle>
+          <circle cx="60" cy="60" r="54" class="score-fill" id="scoreCircle"></circle>
+        </svg>
+        <div class="score-text">
+          <div class="score-value" id="scoreValue">--</div>
+          <div class="score-label" id="scoreLabel">Scanning</div>
+        </div>
+      </div>
+      <div class="score-bar">
+        <div class="score-bar-fill" id="scoreBar"></div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2 class="card-title">Current Site</h2>
+        <div class="site-info">
+          <div class="site-domain" id="siteDomain">--</div>
+          <div class="site-url" id="siteUrl">--</div>
+          <div class="badge-row">
+            <span class="badge" id="protocolBadge">--</span>
+          </div>
+          <div class="stat-row">
+            <div class="stat">
+              <span class="stat-label">Status</span>
+              <span class="stat-value" id="status-text">Scanning...</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Network Alerts Section -->
+      <div id="network-alerts"></div>
+
+      <div class="card">
+        <h2 class="card-title">Extensions</h2>
+              <span class="stat-label">Third-party</span>
+              <span class="stat-value" id="thirdPartyCount">0</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label">Trackers</span>
+              <span class="stat-value" id="trackerCount">0</span>
+            </div>
+          </div>
+          <div id="siteWarnings" class="warnings"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title">Extensions</h2>
+        <div class="ext-summary">
+          <div class="ext-stat">
+            <span class="ext-badge high">●</span>
+            <span class="ext-label">High</span>
+            <span class="ext-count" id="highCount">0</span>
+          </div>
+          <div class="ext-stat">
+            <span class="ext-badge medium">●</span>
+            <span class="ext-label">Medium</span>
+            <span class="ext-count" id="mediumCount">0</span>
+          </div>
+          <div class="ext-stat">
+            <span class="ext-badge low">●</span>
+            <span class="ext-label">Low</span>
+            <span class="ext-count" id="lowCount">0</span>
+          </div>
+          <div class="ext-stat">
+            <span class="ext-badge disabled">●</span>
+            <span class="ext-label">Disabled</span>
+            <span class="ext-count" id="disabledCount">0</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 class="card-title">Installed Extensions</h2>
+      <div id="extensionsList" class="extensions-list"></div>
+    </div>
+
+    <footer class="footer">
+      <div class="legend">
+        <span class="legend-item">
+          <span class="legend-dot high">●</span> High Risk
+        </span>
+        <span class="legend-item">
+          <span class="legend-dot medium">●</span> Medium
+        </span>
+        <span class="legend-item">
+          <span class="legend-dot low">●</span> Low Risk
+        </span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
