@@ -88,7 +88,8 @@
       'mouseflow.com': { name: 'Mouseflow', category: 'Analytics', risk: 'HIGH', purpose: 'Session replay, heatmaps, form analytics' },
       'crazyegg.com': { name: 'Crazy Egg', category: 'Analytics', risk: 'MEDIUM', purpose: 'Heatmaps & scroll tracking' },
       'statcounter.com': { name: 'StatCounter', category: 'Analytics', risk: 'LOW', purpose: 'Web analytics & visitor tracking' },
-      'clicky.com': { name: 'Clicky', category: 'Analytics', risk: 'MEDIUM', purpose: 'Real-time web analytics' }
+      'clicky.com': { name: 'Clicky', category: 'Analytics', risk: 'MEDIUM', purpose: 'Real-time web analytics' },
+      'optimizely.com': { name: 'Optimizely', category: 'Analytics', risk: 'MEDIUM', purpose: 'A/B testing & experimentation (collects user interaction data)' }
     },
     
     // Advertising & Retargeting
@@ -263,6 +264,7 @@
       'facebook.com', 'twitter.com', 'linkedin.com', 'instagram.com',
       'netflix.com', 'spotify.com', 'dropbox.com',
       'salesforce.com', 'oracle.com', 'ibm.com', 'adobe.com',
+      'optimizely.com',
       // News & Media sites (legitimate but heavy tracking)
       'cnn.com', 'bbc.com', 'nytimes.com', 'washingtonpost.com',
       'forbes.com', 'reuters.com', 'bloomberg.com', 'theguardian.com',
